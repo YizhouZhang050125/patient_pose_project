@@ -1,5 +1,6 @@
 import csv
 import os
+import time
 from collections import defaultdict, deque
 
 import cv2
@@ -7,9 +8,13 @@ import mediapipe as mp
 
 from utils import calculate_angle
 
-INPUT_VIDEO = "input/test1.MOV"
-OUTPUT_VIDEO = "output/annotated_output2.mp4"
-OUTPUT_CSV = "output/angles2.csv"
+# ========= SETTINGS =========
+CAMERA_INDEX = 0
+SAVE_OUTPUT_VIDEO = False
+SAVE_OUTPUT_CSV = True
+
+OUTPUT_VIDEO = "output/live_annotated_output.mp4"
+OUTPUT_CSV = "output/live_angles.csv"
 
 os.makedirs("output", exist_ok=True)
 
@@ -33,17 +38,15 @@ def clamp_point(x, y, width, height, pad=10):
 
 def draw_label(frame, text, anchor_point, width, height, used_boxes):
     """
-    Draw label near anchor_point while trying to avoid overlap with other labels.
+    Draw label near anchor point while trying to avoid overlap.
     """
     font = cv2.FONT_HERSHEY_SIMPLEX
     font_scale = 0.5
     thickness = 2
     padding = 4
 
-    text_size, baseline = cv2.getTextSize(text, font, font_scale, thickness)
-    tw, th = text_size
+    (tw, th), baseline = cv2.getTextSize(text, font, font_scale, thickness)
 
-    # Candidate offsets around the joint
     offsets = [
         (15, -15),
         (15, 20),
@@ -69,7 +72,6 @@ def draw_label(frame, text, anchor_point, width, height, used_boxes):
     for dx, dy in offsets:
         tx = ax + dx
         ty = ay + dy
-
         tx, ty = clamp_point(tx, ty, width, height)
 
         box = (
@@ -110,27 +112,42 @@ def draw_label(frame, text, anchor_point, width, height, used_boxes):
     )
 
 
-cap = cv2.VideoCapture(INPUT_VIDEO)
+def main():
+    cap = cv2.VideoCapture(CAMERA_INDEX)
 
-if not cap.isOpened():
-    raise RuntimeError(f"Could not open input video: {INPUT_VIDEO}")
+    if not cap.isOpened():
+        raise RuntimeError(
+            f"Could not open camera index {CAMERA_INDEX}. "
+            "Try CAMERA_INDEX = 1 if you have another camera."
+        )
 
-fps = cap.get(cv2.CAP_PROP_FPS)
-if fps <= 0:
-    fps = 30.0
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    if fps <= 0 or fps > 120:
+        fps = 30.0
 
-width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 
-fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-video_writer = cv2.VideoWriter(OUTPUT_VIDEO, fourcc, fps, (width, height))
+    if width <= 0 or height <= 0:
+        width, height = 640, 480
 
-# Smooth angles a bit so labels do not jump too much
-angle_history = defaultdict(lambda: deque(maxlen=5))
+    video_writer = None
+    if SAVE_OUTPUT_VIDEO:
+        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+        video_writer = cv2.VideoWriter(OUTPUT_VIDEO, fourcc, fps, (width, height))
 
-with open(OUTPUT_CSV, mode="w", newline="", encoding="utf-8") as csv_file:
-    csv_writer = csv.writer(csv_file)
-    csv_writer.writerow(["frame", "time_sec", "joint", "angle_deg"])
+    csv_file = None
+    csv_writer = None
+    if SAVE_OUTPUT_CSV:
+        csv_file = open(OUTPUT_CSV, mode="w", newline="", encoding="utf-8")
+        csv_writer = csv.writer(csv_file)
+        csv_writer.writerow(["frame", "time_sec", "joint", "angle_deg"])
+
+    # Smooth angles so numbers do not jump too much
+    angle_history = defaultdict(lambda: deque(maxlen=5))
+
+    start_time = time.time()
+    frame_index = 0
 
     with mp_pose.Pose(
         static_image_mode=False,
@@ -140,21 +157,24 @@ with open(OUTPUT_CSV, mode="w", newline="", encoding="utf-8") as csv_file:
         min_tracking_confidence=0.5,
     ) as pose:
 
-        frame_index = 0
-
         while True:
             success, frame = cap.read()
             if not success:
+                print("Failed to read frame from camera.")
                 break
 
-            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            # Optional mirror view so it feels natural like a webcam
+            frame = cv2.flip(frame, 1)
+
+            display_frame = frame.copy()
+            rgb = cv2.cvtColor(display_frame, cv2.COLOR_BGR2RGB)
             results = pose.process(rgb)
 
             if results.pose_landmarks:
                 landmarks = results.pose_landmarks.landmark
 
                 mp_drawing.draw_landmarks(
-                    frame,
+                    display_frame,
                     results.pose_landmarks,
                     mp_pose.POSE_CONNECTIONS
                 )
@@ -178,7 +198,6 @@ with open(OUTPUT_CSV, mode="w", newline="", encoding="utf-8") as csv_file:
                 R_ANKLE = mp_pose.PoseLandmark.RIGHT_ANKLE.value
                 R_HEEL = mp_pose.PoseLandmark.RIGHT_HEEL.value
 
-                # (joint_name, pointA, jointPointB, pointC)
                 joint_definitions = [
                     ("left_shoulder", L_HIP, L_SHOULDER, L_ELBOW),
                     ("right_shoulder", R_HIP, R_SHOULDER, R_ELBOW),
@@ -216,20 +235,54 @@ with open(OUTPUT_CSV, mode="w", newline="", encoding="utf-8") as csv_file:
                     smooth_angle = sum(angle_history[joint_name]) / len(angle_history[joint_name])
 
                     label = f"{joint_name}: {smooth_angle:.2f}°"
-                    draw_label(frame, label, b, width, height, used_boxes)
+                    draw_label(display_frame, label, b, width, height, used_boxes)
 
-                    csv_writer.writerow([
-                        frame_index,
-                        round(frame_index / fps, 3),
-                        joint_name,
-                        round(smooth_angle, 2)
-                    ])
+                    if csv_writer is not None:
+                        elapsed = time.time() - start_time
+                        csv_writer.writerow([
+                            frame_index,
+                            round(elapsed, 3),
+                            joint_name,
+                            round(smooth_angle, 2),
+                        ])
 
-            video_writer.write(frame)
+            cv2.putText(
+                display_frame,
+                "Press Q to quit",
+                (20, 30),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.7,
+                (255, 255, 255),
+                2,
+                cv2.LINE_AA
+            )
+
+            cv2.imshow("Live Pose and Joint Angles", display_frame)
+
+            if video_writer is not None:
+                video_writer.write(display_frame)
+
             frame_index += 1
 
-cap.release()
-video_writer.release()
+            key = cv2.waitKey(1) & 0xFF
+            if key == ord("q"):
+                break
 
-print(f"Saved annotated video to: {OUTPUT_VIDEO}")
-print(f"Saved angle CSV to: {OUTPUT_CSV}")
+    cap.release()
+
+    if video_writer is not None:
+        video_writer.release()
+
+    if csv_file is not None:
+        csv_file.close()
+
+    cv2.destroyAllWindows()
+
+    if SAVE_OUTPUT_VIDEO:
+        print(f"Saved video to: {OUTPUT_VIDEO}")
+    if SAVE_OUTPUT_CSV:
+        print(f"Saved CSV to: {OUTPUT_CSV}")
+
+
+if __name__ == "__main__":
+    main()
